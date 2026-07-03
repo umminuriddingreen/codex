@@ -241,6 +241,37 @@ impl ConfiguredModelProvider {
             auth_manager,
         }
     }
+
+    /// Returns whether this provider uses OpenAI auth and has credentials available.
+    fn has_openai_auth(&self) -> bool {
+        self.info.requires_openai_auth
+            && self
+                .auth_manager
+                .as_ref()
+                .and_then(|auth_manager| auth_manager.auth_cached())
+                .is_some()
+    }
+}
+
+/// Merge the bundled built-in model catalog with a custom catalog loaded from
+/// `model_catalog_json`, deduplicating by model slug. Custom entries override
+/// built-in models that share a slug and are appended otherwise, so they keep
+/// their provider association while the built-in models stay available.
+fn merge_builtin_models_into_catalog(model_catalog: ModelsResponse) -> ModelsResponse {
+    let mut models = codex_models_manager::bundled_models_response()
+        .map(|bundled| bundled.models)
+        .unwrap_or_default();
+    for model in model_catalog.models {
+        if let Some(existing) = models
+            .iter_mut()
+            .find(|existing| existing.slug == model.slug)
+        {
+            *existing = model;
+        } else {
+            models.push(model);
+        }
+    }
+    ModelsResponse { models }
 }
 
 impl ModelProvider for ConfiguredModelProvider {
@@ -313,10 +344,20 @@ impl ModelProvider for ConfiguredModelProvider {
         config_model_catalog: Option<ModelsResponse>,
     ) -> SharedModelsManager {
         match config_model_catalog {
-            Some(model_catalog) => Arc::new(StaticModelsManager::new(
-                self.auth_manager.clone(),
-                model_catalog,
-            )),
+            Some(model_catalog) => {
+                // When the user is authenticated with OpenAI, a custom catalog
+                // should extend the built-in model list rather than replace it,
+                // so OpenAI models remain available alongside the custom entries.
+                let model_catalog = if self.has_openai_auth() {
+                    merge_builtin_models_into_catalog(model_catalog)
+                } else {
+                    model_catalog
+                };
+                Arc::new(StaticModelsManager::new(
+                    self.auth_manager.clone(),
+                    model_catalog,
+                ))
+            }
             None => {
                 let endpoint = Arc::new(OpenAiModelsEndpoint::new(
                     self.info.clone(),
@@ -751,6 +792,89 @@ mod tests {
                 .models
                 .iter()
                 .any(|model| model.slug == "provider-model")
+        );
+    }
+
+    #[tokio::test]
+    async fn config_model_catalog_merges_builtin_models_when_openai_authenticated() {
+        let provider = create_model_provider(
+            ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+            Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+                "openai-api-key",
+            ))),
+        );
+
+        let manager = provider.models_manager(
+            test_codex_home(),
+            Some(ModelsResponse {
+                models: vec![remote_model("custom-catalog-model")],
+            }),
+        );
+        let catalog = manager.raw_model_catalog(RefreshStrategy::Offline).await;
+
+        assert!(
+            catalog
+                .models
+                .iter()
+                .any(|model| model.slug == "custom-catalog-model"),
+            "custom catalog entry should be available"
+        );
+        assert!(
+            catalog.models.iter().any(|model| model.slug == "gpt-5.5"),
+            "built-in models should remain available"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_model_catalog_overrides_builtin_models_by_slug_when_merging() {
+        let provider = create_model_provider(
+            ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+            Some(AuthManager::from_auth_for_testing(CodexAuth::from_api_key(
+                "openai-api-key",
+            ))),
+        );
+
+        let mut override_model = remote_model("gpt-5.5");
+        override_model.display_name = "custom gpt-5.5".to_string();
+        let manager = provider.models_manager(
+            test_codex_home(),
+            Some(ModelsResponse {
+                models: vec![override_model],
+            }),
+        );
+        let catalog = manager.raw_model_catalog(RefreshStrategy::Offline).await;
+
+        let matching: Vec<_> = catalog
+            .models
+            .iter()
+            .filter(|model| model.slug == "gpt-5.5")
+            .collect();
+        assert_eq!(matching.len(), 1, "merged catalog should dedupe by slug");
+        assert_eq!(matching[0].display_name, "custom gpt-5.5");
+    }
+
+    #[tokio::test]
+    async fn config_model_catalog_replaces_builtin_models_without_openai_auth() {
+        let provider = create_model_provider(
+            ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+            /*auth_manager*/ None,
+        );
+
+        let manager = provider.models_manager(
+            test_codex_home(),
+            Some(ModelsResponse {
+                models: vec![remote_model("custom-catalog-model")],
+            }),
+        );
+        let catalog = manager.raw_model_catalog(RefreshStrategy::Offline).await;
+
+        assert_eq!(
+            catalog
+                .models
+                .iter()
+                .map(|model| model.slug.clone())
+                .collect::<Vec<_>>(),
+            vec!["custom-catalog-model".to_string()]
         );
     }
 }
